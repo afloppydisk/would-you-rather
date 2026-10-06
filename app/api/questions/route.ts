@@ -1,6 +1,26 @@
-import {env} from 'cloudflare:workers';
-const seeds=[['future','see 10 minutes into the future','see 150 years into the future','Superpowers'],['mind','have telekinesis — move things with your mind','have telepathy — read minds','Superpowers'],['heroes','team up with Wonder Woman','team up with Captain Marvel','Pop culture'],['music','sing along to every song you hear','dance to every song you hear','Life choices'],['time','be in jail for five years','be in a coma for a decade','Life choices']];
-async function seed(){await env.DB.batch(seeds.map(q=>env.DB.prepare('INSERT OR IGNORE INTO questions (id,a,b,category) VALUES (?,?,?,?)').bind(...q)))}
-async function counts(id:string){return await env.DB.prepare('SELECT COALESCE(SUM(choice=0),0) AS aVotes,COALESCE(SUM(choice=1),0) AS bVotes FROM votes WHERE question=?').bind(id).first()}
-export async function GET(){await seed();const r=await env.DB.prepare('SELECT q.*,COALESCE(SUM(v.choice=0),0) AS aVotes,COALESCE(SUM(v.choice=1),0) AS bVotes FROM questions q LEFT JOIN votes v ON q.id=v.question GROUP BY q.id ORDER BY q.rowid').all();return Response.json(r.results)}
-export async function POST(req:Request){try{const x=await req.json();if(x.action==='vote'){if(![0,1].includes(x.choice)||typeof x.id!=='string'||typeof x.voter!=='string'||!/^[a-z0-9-]{36}$/i.test(x.voter))return new Response('Invalid vote',{status:400});const q=await env.DB.prepare('SELECT id FROM questions WHERE id=?').bind(x.id).first();if(!q)return new Response('Not found',{status:404});await env.DB.prepare('INSERT OR IGNORE INTO votes (question,voter,choice) VALUES (?,?,?)').bind(x.id,x.voter,x.choice).run();return Response.json(await counts(x.id))}if(x.action==='add'&&typeof x.a==='string'&&typeof x.b==='string'&&x.a.trim()&&x.b.trim()&&x.a.length<=240&&x.b.length<=240&&x.a.trim().toLowerCase()!==x.b.trim().toLowerCase()&&['Superpowers','Pop culture','Life choices'].includes(x.category)){await env.DB.prepare('INSERT INTO questions (id,a,b,category) VALUES (?,?,?,?)').bind(crypto.randomUUID(),x.a.trim(),x.b.trim(),x.category).run();return Response.json({ok:true})}return new Response('Invalid question',{status:400})}catch{return new Response('Request failed',{status:400})}}
+import {z} from 'zod';
+import {counts,currentEdition,database,editionView,json,validOrigin,voterId} from '@/lib/game';
+export async function GET(req:Request) {
+  try {
+    const edition=await currentEdition();
+    if(!edition) return json({error:'No question available'},503);
+    return json(await editionView(req,edition,new URL(req.url).searchParams.get('voter')));
+  } catch {return json({error:'Could not load the question. Please try again.'},503)}
+}
+export async function POST(req:Request) {
+  if(!validOrigin(req)) return json({error:'Invalid origin'},403);
+  try {
+    const x=z.object({action:z.literal('vote'),id:z.string(),number:z.number().int(),choice:z.union([z.literal(0),z.literal(1)]),voter:z.string().optional()}).parse(await req.json());
+    if(x.action!=='vote'||![0,1].includes(x.choice)||typeof x.id!=='string'||!Number.isInteger(x.number)) return json({error:'Invalid vote'},400);
+    const voter=voterId(req,x.voter);
+    if(!voter) return json({error:'A browser voter ID is required'},400);
+    const edition=await currentEdition();
+    if(!edition||edition.question!==x.id||edition.number!==x.number||edition.closes_at<=Date.now()) return json({error:'This question has closed.',expired:true},409);
+    // The time check is also in the INSERT so a request cannot vote after the boundary.
+    await database().prepare('INSERT OR IGNORE INTO votes (question,voter,choice) SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM editions WHERE number=? AND question=? AND closes_at>?)')
+      .bind(x.id,voter,x.choice,x.number,x.id,Date.now()).run();
+    const vote=await database().prepare('SELECT choice FROM votes WHERE question=? AND voter=?').bind(x.id,voter).first<{choice:number}>();
+    if(!vote) return json({error:'This question has closed.',expired:true},409);
+    return json({...await counts(x.id),choice:vote.choice});
+  } catch {return json({error:'Your vote could not be saved. Try again.'},400)}
+}
